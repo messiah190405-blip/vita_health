@@ -251,3 +251,53 @@ class SupabaseHealthRepository:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(sql, (patient_id, vaccine_name, dose_number, administered_by, next_due_date))
             conn.commit()
+
+    def _resolve_db_uri(self) -> str:
+        for attr in ("dsn", "database_url", "connection_string", "db_url", "uri"):
+            val = getattr(self, attr, None)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+        for env_key in ("DATABASE_URL", "SUPABASE_DB_URL", "VITA_HEALTH_DB_URL"):
+            val = os.getenv(env_key)
+            if val and val.strip():
+                return val.strip()
+
+        raise RuntimeError(
+            "No database connection string found on SupabaseHealthRepository or in environment "
+            "(DATABASE_URL / SUPABASE_DB_URL)."
+        )
+
+
+    def authenticate_clinician(self, identifier: str, password: str) -> Optional[Dict[str, Any]]:
+        """Authenticates a clinician by badge_code or email against vita_health.authenticate_clinician."""
+        sql = """
+            SELECT
+                staff_id,
+                full_name,
+                role_title,
+                badge_code,
+                email,
+                facility_id,
+                label,
+                last_login_at
+            FROM vita_health.authenticate_clinician(%s, %s);
+        """
+        uri = self._resolve_db_uri()
+        with psycopg2.connect(uri, options="-c search_path=vita_health,extensions,public") as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (identifier.strip(), password))
+                row = cur.fetchone()
+                conn.commit()
+                if not row:
+                    return None
+                return {
+                    "staff_id": row[0],
+                    "full_name": row[1],
+                    "role_title": row[2],
+                    "badge_code": row[3],
+                    "email": row[4],
+                    "facility_id": row[5],
+                    "label": row[6],
+                    "last_login_at": str(row[7]) if row[7] else None,
+                }

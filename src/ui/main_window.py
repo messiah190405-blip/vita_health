@@ -297,13 +297,16 @@ class ClinicianProfileSwitcher(QWidget):
         self.setFixedHeight(74)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-    def setProfiles(self, items: List[Tuple[str, Any]]) -> None:
+    def setProfiles(self, items: List[Tuple[str, Any]], active_index: int = 0) -> None:
         self._profiles = list(items)
-        self._index = 0
+        if not self._profiles:
+            self._index = 0
+        else:
+            self._index = max(0, min(active_index, len(self._profiles) - 1))
         self.update()
 
     def setCurrentIndex(self, idx: int) -> None:
-        if 0 <= idx < len(self._profiles) and idx != self._index:
+        if 0 <= idx < len(self._profiles):
             self._index = idx
             self.update()
 
@@ -755,9 +758,14 @@ class VitaHealthMainWindow(QMainWindow):
     navigation, async spinners, and audit log filtering.
     """
 
-    def __init__(self, repo: SupabaseHealthRepository) -> None:
+    def __init__(
+        self,
+        repo: SupabaseHealthRepository,
+        current_clinician: Optional[Dict[str, Any]] = None,
+    ) -> None:
         super().__init__()
         self.repo = repo
+        self.current_clinician: Optional[Dict[str, Any]] = current_clinician
         self.registry = InMemoryTriageRegistry()
         self.selected_triage_filter = "ALL"
         self.selected_encounter: Optional[ClinicalEncounter] = None
@@ -771,10 +779,50 @@ class VitaHealthMainWindow(QMainWindow):
         self.setStyleSheet(NOIR_ESPRESSO_CREAM_QSS)
 
         self._build_ui()
+        self.set_active_clinician(self.current_clinician)
         self._bind_shortcuts()
         self._wire_live_acuity_preview()
         self._wire_form_pass_through()
         self.trigger_sync()
+
+    @staticmethod
+    def _format_clinician_label(clinician: Dict[str, Any]) -> str:
+        if clinician.get("label"):
+            return str(clinician["label"]).strip()
+        name = str(clinician.get("full_name") or "On-Duty Clinician").strip()
+        role = str(clinician.get("role_title") or "").strip()
+        return f"{name} · {role}" if role else name
+
+    def set_active_clinician(self, clinician: Optional[Dict[str, Any]]) -> None:
+        """Ensures the signed-in clinician is displayed in the bottom profile switcher and synced."""
+        if not clinician:
+            return
+
+        self.current_clinician = dict(clinician)
+        staff_id = clinician.get("staff_id")
+        label = self._format_clinician_label(clinician)
+
+        profiles = list(getattr(self.duty_clinician_combo, "_profiles", []))
+        match_idx = next(
+            (
+                i for i, (lbl, sid) in enumerate(profiles)
+                if (staff_id is not None and sid == staff_id) or lbl == label
+            ),
+            None,
+        )
+
+        if match_idx is None:
+            profiles.insert(0, (label, staff_id))
+            match_idx = 0
+        else:
+            profiles[match_idx] = (label, staff_id if staff_id is not None else profiles[match_idx][1])
+
+        self.duty_clinician_combo.setProfiles(profiles, active_index=match_idx)
+
+        if staff_id is not None and hasattr(self, "in_clinician"):
+            combo_idx = self.in_clinician.findData(staff_id)
+            if combo_idx >= 0:
+                self.in_clinician.setCurrentIndex(combo_idx)
 
     def _style_table(
         self,
@@ -931,11 +979,17 @@ class VitaHealthMainWindow(QMainWindow):
 
     def _on_duty_clinician_changed(self, _index: int) -> None:
         staff_id = self.duty_clinician_combo.currentData()
+        label = self.duty_clinician_combo.currentText()
         if staff_id is not None and hasattr(self, "in_clinician"):
             idx = self.in_clinician.findData(staff_id)
             if idx >= 0 and self.in_clinician.currentIndex() != idx:
                 self.in_clinician.setCurrentIndex(idx)
-        self._show_toast(f"Active profile: {self.duty_clinician_combo.currentText()}")
+        self.current_clinician = {
+            **(self.current_clinician or {}),
+            "staff_id": staff_id,
+            "label": label,
+        }
+        self._show_toast(f"Active profile: {label}")
 
     def _wire_form_pass_through(self) -> None:
         """Pressing Return/Enter in intake inputs advances focus cleanly to the next input."""
@@ -1022,6 +1076,8 @@ class VitaHealthMainWindow(QMainWindow):
         def _done(bundle: Dict[str, Any]) -> None:
             self.registry.sync_all(bundle["encounters"])
             self._populate_dropdowns(bundle["facilities"], bundle["clinicians"])
+            if self.current_clinician:
+                self.set_active_clinician(self.current_clinician)
             self._apply_local_filters()
             self._update_kpis()
             self.sync_spinner.stop()
@@ -1571,7 +1627,7 @@ class VitaHealthMainWindow(QMainWindow):
         if self.in_clinician.count() == 0:
             for c in clinicians:
                 self.in_clinician.addItem(c["label"], c["staff_id"])
-        if self.duty_clinician_combo.currentData() is None and clinicians:
+        if not getattr(self.duty_clinician_combo, "_profiles", None) and clinicians:
             self.duty_clinician_combo.setProfiles([(c["label"], c["staff_id"]) for c in clinicians])
 
     def _update_kpis(self) -> None:
